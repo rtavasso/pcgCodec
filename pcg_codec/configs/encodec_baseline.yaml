@@ -1,0 +1,16 @@
+codec: "encodec"
+dataset: "speech_example"
+
+streaming:
+  sample_rate_hz: 24000
+  hop_samples: 320
+  lookahead_samples: 0
+  depth: 1
+
+baseline:
+  mode: "encodec_raw"  # encodec_raw | encodec_lm
+  bitrate_kbps: 6.0
+
+output:
+  results_dir: "pcg_codec/results"
+  run_name_prefix: "encodec"

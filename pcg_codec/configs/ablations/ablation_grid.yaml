@@ -1,0 +1,62 @@
+schema_version: 1
+
+description: "PCG-Codec ablation grid: quantizer x depth x sens-eq, with lambda sweep."
+
+# Targets used for matched-bitrate filtering during summarization.
+targets:
+  bitrate_kbps: [1.5, 3, 6, 12]
+  tolerance_pct: 2.0
+
+# Lambda sweep for RD curve tracing. Use enough points to bracket targets.
+# Actual matching is done post-hoc by summarize_results.py.
+lambda_grid: [0.0005, 0.001, 0.002, 0.004, 0.008]
+
+# Factor grid. Each entry provides a human-friendly name and config overrides.
+# Overrides are merged into pcg_base.yaml for each run.
+grid:
+  quantizer:
+    - name: fsq
+      overrides:
+        model:
+          quantizer:
+            type: fsq
+            levels: 8
+    - name: block_codebook
+      overrides:
+        model:
+          quantizer:
+            type: block_codebook
+            codebook_size: 256
+
+  depth:
+    - name: d1
+      overrides:
+        model:
+          dag:
+            depth: 1
+            parents_k: 0
+    - name: d2
+      overrides:
+        model:
+          dag:
+            depth: 2
+            parents_k: 2
+    - name: d3
+      overrides:
+        model:
+          dag:
+            depth: 3
+            parents_k: 2
+
+  sens_eq:
+    - name: se_off
+      overrides:
+        loss:
+          sens_eq:
+            enabled: false
+    - name: se_on
+      overrides:
+        loss:
+          sens_eq:
+            enabled: true
+            weight: 0.1

@@ -1,0 +1,64 @@
+codec: "pcg"
+dataset: "speech_example"
+
+streaming:
+  sample_rate_hz: 24000
+  hop_samples: 320
+  lookahead_samples: 0
+
+model:
+  latent_dim: 32
+  num_blocks: 8
+  block_dim: 4
+
+  encoder:
+    hidden_dim: 128
+  decoder:
+    hidden_dim: 128
+
+  transform:
+    type: "mixing"  # mixing | identity
+
+  quantizer:
+    type: "fsq"  # fsq | block_codebook
+    levels: 8         # FSQ levels per dimension
+    codebook_size: 256  # used by block_codebook
+
+  dag:
+    depth: 1
+    parents_k: 2
+    seed: 0
+
+  prior:
+    hidden_dim: 128
+    embed_dim: 64
+
+loss:
+  waveform:
+    type: "l1"
+  mrstft:
+    enabled: true
+    fft_sizes: [256, 512, 1024]
+    hop_sizes: [64, 128, 256]
+    win_lengths: [256, 512, 1024]
+  sens_eq:
+    enabled: false
+    weight: 0.1
+
+training:
+  seed: 0
+  device: "cpu"
+  batch_size: 8
+  steps: 1000
+  lr: 0.001
+  log_every: 50
+  eval_every: 200
+  lambda_rd: 0.01
+
+evaluation:
+  split: "test"
+  num_batches: 10
+
+output:
+  results_dir: "pcg_codec/results"
+  run_name_prefix: "pcg"

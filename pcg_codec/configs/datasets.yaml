@@ -1,0 +1,23 @@
+defaults:
+  sample_rate_hz: 24000
+  mono: true
+  segment_seconds: 4.0
+  split:
+    train_pct: 80
+    val_pct: 10
+    test_pct: 10
+
+datasets:
+  # These are local placeholders to satisfy the experimentation spec without requiring network access.
+  speech_example:
+    kind: "local_wav_dir"
+    root: "pcg_codec/data/speech_example"
+    split_hash: "speech_example_v1"
+    sample_rate_hz: 24000
+    segment_seconds: 4.0
+  music_example:
+    kind: "local_wav_dir"
+    root: "pcg_codec/data/music_example"
+    split_hash: "music_example_v1"
+    sample_rate_hz: 24000
+    segment_seconds: 4.0

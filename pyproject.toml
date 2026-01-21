@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pcg-codec"
+version = "0.1.0"
+description = "PCG-Codec: Parallel-Conditional Graph Codec experimentation harness"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "torch>=2.1",
+  "soundfile>=0.12",
+  "scipy>=1.10",
+  "matplotlib>=3.7",
+  "tqdm>=4.66",
+  "pytest>=7.4",
+]
+
+[project.optional-dependencies]
+encodec = ["encodec>=0.1.1"]
+
+[tool.setuptools.packages.find]
+include = ["pcg_codec*"]
+
+[tool.pytest.ini_options]
+testpaths = ["pcg_codec/tests"]
+addopts = "-q"
+
