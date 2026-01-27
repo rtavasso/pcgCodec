@@ -4,6 +4,7 @@ import argparse
 import io
 import json
 import os
+import struct
 import time
 from dataclasses import dataclass
 from typing import Iterator, Optional
@@ -25,6 +26,7 @@ from ..entropy.streams import (
     FramePacket,
     LayeredEntropyDecoder,
     LayeredEntropyEncoder,
+    StreamingContainerReader,
     stable_params_hash,
     write_container,
 )
@@ -302,6 +304,16 @@ def _si_sdr(x: torch.Tensor, x_hat: torch.Tensor, eps: float = 1e-8) -> torch.Te
     return 10.0 * torch.log10(ratio)
 
 
+def _pcg_container_header_end(data: bytes) -> int:
+    # Container layout is defined in pcg_codec/pcg/entropy/streams.py.
+    if len(data) < 9:
+        raise ValueError("container too short to include header")
+    if data[0:4] != b"PCGC":
+        raise ValueError("Not a PCG container (bad magic)")
+    header_len = struct.unpack_from("<I", data, 5)[0]
+    return 9 + int(header_len)
+
+
 @dataclass(frozen=True)
 class StreamingEvalResult:
     bytes_total: int
@@ -466,13 +478,65 @@ def evaluate_streaming(
                 frames_total += 1
                 bps_per_frame.append(8.0 * bytes_frame / (hop / sr))
 
+            if ttfa_ms is None:
+                chunk_bytes = int(cfg.get("evaluation", {}).get("ttfa_chunk_bytes", 256))
+                if chunk_bytes <= 0:
+                    chunk_bytes = 256
+
+                header = ContainerHeader(
+                    sample_rate_hz=sr,
+                    hop_samples=hop,
+                    encoder_lookahead_samples=lookahead,
+                    codec_name=str(cfg.get("codec", "pcg")),
+                    params_hash=stable_params_hash(cfg),
+                )
+                buf = io.BytesIO()
+                write_container(buf, header=header, frames=packets)
+                container_bytes = buf.getvalue()
+
+                reader = StreamingContainerReader()
+                header_end = _pcg_container_header_end(container_bytes)
+                _ = reader.feed(container_bytes[:header_end])  # parse header (not timed)
+
+                # Measure decode time from first post-header byte receipt to first PCM frame output.
+                ttfa_decoder = LayeredEntropyDecoder(dag=dag, prior=prior, cfg=rans_cfg)
+                ttfa_decoder.reset()
+                components.decoder.reset()
+                t0 = time.perf_counter()
+                offset = header_end
+                while offset < len(container_bytes):
+                    chunk = container_bytes[offset : offset + chunk_bytes]
+                    offset += len(chunk)
+                    ready = reader.feed(chunk)
+                    if not ready:
+                        continue
+                    pkt0 = ready[0]
+                    ttfa_decoder.start_frame()
+                    for li, lb in enumerate(pkt0.layer_bytes, start=1):
+                        ttfa_decoder.push_layer_bytes(li, lb)
+                        ttfa_decoder.entropy_decode_layer(li)
+                    q_dec = ttfa_decoder.decoder_step()
+                    if isinstance(components.quantizer, FSQQuantizer):
+                        z_q = components.quantizer.dequantize(q_dec.unsqueeze(0))
+                    elif isinstance(components.quantizer, BlockCodebookQuantizer):
+                        z_q = components.quantizer.dequantize(q_dec.unsqueeze(0))
+                    else:
+                        raise RuntimeError("Unsupported quantizer type for streaming decode")
+                    z_inv = components.transform.inverse(z_q)
+                    _ = components.decoder.decode_frame(z_inv.squeeze(0))
+                    t1 = time.perf_counter()
+                    ttfa_ms = 1000.0 * (t1 - t0)
+                    break
+
+                # Restore decoder state for the main decode loop.
+                entropy_decoder.reset()
+                components.decoder.reset()
+
             # Decode frames back to audio.
             decoded_frames: list[torch.Tensor] = []
             for fi, pkt in enumerate(packets):
                 entropy_decoder.start_frame()
                 for li, lb in enumerate(pkt.layer_bytes, start=1):
-                    if fi == 0 and li == 1 and ttfa_ms is None:
-                        t0 = time.perf_counter()
                     entropy_decoder.push_layer_bytes(li, lb)
                     entropy_decoder.entropy_decode_layer(li)
                 q_dec = entropy_decoder.decoder_step()
@@ -485,9 +549,6 @@ def evaluate_streaming(
                 z_inv = components.transform.inverse(z_q)
                 x_hat = components.decoder.decode_frame(z_inv.squeeze(0))  # (1, hop)
                 decoded_frames.append(x_hat.squeeze(0).detach().cpu())
-                if fi == 0 and ttfa_ms is None:
-                    t1 = time.perf_counter()
-                    ttfa_ms = 1000.0 * (t1 - t0)
 
             x_hat_items.append(torch.cat(decoded_frames, dim=0).numpy()[: len(x_b)])
 

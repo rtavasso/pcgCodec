@@ -43,6 +43,13 @@ loss:
     fft_sizes: [256, 512, 1024]
     hop_sizes: [64, 128, 256]
     win_lengths: [256, 512, 1024]
+  transform:
+    orth:
+      enabled: true
+      weight: 0.001
+    offdiag_cov:
+      enabled: true
+      weight: 0.001
   sens_eq:
     enabled: false
     weight: 0.1
@@ -61,6 +68,7 @@ training:
 evaluation:
   split: "val"
   num_batches: 10
+  ttfa_chunk_bytes: 256
 
 output:
   results_dir: "pcg_codec/results"

@@ -41,6 +41,15 @@ loss:
     fft_sizes: [256, 512, 1024]
     hop_sizes: [64, 128, 256]
     win_lengths: [256, 512, 1024]
+  # Regularizers for distribution shaping / packing.
+  # Applies to MixingTransform; IdentityTransform returns 0.
+  transform:
+    orth:
+      enabled: true
+      weight: 0.001
+    offdiag_cov:
+      enabled: true
+      weight: 0.001
   sens_eq:
     enabled: false
     weight: 0.1
@@ -58,6 +67,8 @@ training:
 evaluation:
   split: "val"
   num_batches: 10
+  # Simulated streaming "network" chunk size used for TTFA measurement.
+  ttfa_chunk_bytes: 256
 
 output:
   results_dir: "pcg_codec/results"

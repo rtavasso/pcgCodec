@@ -89,6 +89,8 @@ def train_step(
     stft_loss: Optional[MultiResolutionSTFTLoss] = None,
     lambda_rate: float = 0.0,
     beta_sens: float = 0.0,
+    gamma_orth: float = 0.0,
+    gamma_cov: float = 0.0,
 ) -> dict:
     components.encoder.train()
     components.decoder.train()
@@ -122,7 +124,16 @@ def train_step(
         num_blocks = _infer_num_blocks(components.quantizer, q_out.symbols.reshape(batch_size, frames, -1))
         sens_loss = sensitivity_equalization(z_flat, recon, num_blocks)
 
-    total = recon + lambda_rate * rate_loss + beta_sens * sens_loss
+    orth_loss = torch.tensor(0.0, device=x.device)
+    if gamma_orth > 0.0 and hasattr(components.transform, "regularizer"):
+        orth_loss = components.transform.regularizer().to(device=x.device)
+
+    cov_loss = torch.tensor(0.0, device=x.device)
+    if gamma_cov > 0.0 and hasattr(components.transform, "offdiag_covariance"):
+        num_blocks = _infer_num_blocks(components.quantizer, q_out.symbols.reshape(batch_size, frames, -1))
+        cov_loss = components.transform.offdiag_covariance(z_flat, num_blocks=num_blocks).to(device=x.device)
+
+    total = recon + lambda_rate * rate_loss + beta_sens * sens_loss + gamma_orth * orth_loss + gamma_cov * cov_loss
     total.backward()
     optimizer.step()
 
@@ -131,6 +142,8 @@ def train_step(
         "recon": float(recon.detach().cpu()),
         "rate": float(rate_loss.detach().cpu()),
         "sens": float(sens_loss.detach().cpu()),
+        "orth": float(orth_loss.detach().cpu()),
+        "cov": float(cov_loss.detach().cpu()),
     }
 
 
@@ -142,8 +155,10 @@ def train_one_epoch(
     stft_loss: Optional[MultiResolutionSTFTLoss] = None,
     lambda_rate: float = 0.0,
     beta_sens: float = 0.0,
+    gamma_orth: float = 0.0,
+    gamma_cov: float = 0.0,
 ) -> dict:
-    metrics = {"loss": 0.0, "recon": 0.0, "rate": 0.0, "sens": 0.0}
+    metrics = {"loss": 0.0, "recon": 0.0, "rate": 0.0, "sens": 0.0, "orth": 0.0, "cov": 0.0}
     steps = 0
     for batch in dataloader:
         out = train_step(
@@ -154,6 +169,8 @@ def train_one_epoch(
             stft_loss=stft_loss,
             lambda_rate=lambda_rate,
             beta_sens=beta_sens,
+            gamma_orth=gamma_orth,
+            gamma_cov=gamma_cov,
         )
         for key in metrics:
             metrics[key] += out[key]
@@ -535,6 +552,11 @@ def main() -> None:
     lambda_rd = float(cfg["training"]["lambda_rd"])
     sens_cfg = cfg["loss"]["sens_eq"]
     beta_sens = float(sens_cfg["weight"]) if bool(sens_cfg.get("enabled", False)) else 0.0
+    tf_cfg = cfg.get("loss", {}).get("transform", {}) or {}
+    orth_cfg = tf_cfg.get("orth", {}) or {}
+    cov_cfg = tf_cfg.get("offdiag_cov", {}) or {}
+    gamma_orth = float(orth_cfg.get("weight", 0.0)) if bool(orth_cfg.get("enabled", False)) else 0.0
+    gamma_cov = float(cov_cfg.get("weight", 0.0)) if bool(cov_cfg.get("enabled", False)) else 0.0
     steps = int(cfg["training"]["steps"])
     log_every = int(cfg["training"]["log_every"])
     eval_every = int(cfg["training"]["eval_every"])
@@ -552,6 +574,8 @@ def main() -> None:
             f"recon={out.get('recon', 0.0):.6f} "
             f"rate={out.get('rate', 0.0):.6f} "
             f"sens={out.get('sens', 0.0):.6f} "
+            f"orth={out.get('orth', 0.0):.6f} "
+            f"cov={out.get('cov', 0.0):.6f} "
             f"wall_s={wall_s:.1f}"
         )
         print(msg, flush=True)
@@ -566,6 +590,8 @@ def main() -> None:
             stft_loss=stft_loss,
             lambda_rate=lambda_rd,
             beta_sens=beta_sens,
+            gamma_orth=gamma_orth,
+            gamma_cov=gamma_cov,
         )
 
         if step % log_every == 0:
