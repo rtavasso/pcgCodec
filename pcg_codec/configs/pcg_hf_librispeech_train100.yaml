@@ -1,8 +1,10 @@
 codec: "pcg"
+#dataset: "librispeech_train100"
 dataset: "librispeech_dummy"
 
 streaming:
-  sample_rate_hz: 24000
+  # LibriSpeech is 16kHz; using 16k avoids resampling.
+  sample_rate_hz: 16000
   hop_samples: 320
   lookahead_samples: 0
 
@@ -12,26 +14,26 @@ model:
   block_dim: 4
 
   encoder:
-    hidden_dim: 128
+    hidden_dim: 256
   decoder:
-    hidden_dim: 128
+    hidden_dim: 256
 
   transform:
     type: "mixing"  # mixing | identity
 
   quantizer:
     type: "fsq"  # fsq | block_codebook
-    levels: 8         # FSQ levels per dimension
-    codebook_size: 256  # used by block_codebook
+    levels: 8
+    codebook_size: 256
 
   dag:
-    depth: 1
+    depth: 2
     parents_k: 2
     seed: 0
 
   prior:
-    hidden_dim: 128
-    embed_dim: 64
+    hidden_dim: 256
+    embed_dim: 128
 
 loss:
   waveform:
@@ -47,12 +49,13 @@ loss:
 
 training:
   seed: 0
-  device: "cpu"
-  batch_size: 8
-  steps: 1000
-  lr: 0.001
+  device: "cuda"
+  batch_size: 64
+  split: "train"
+  steps: 5000
+  lr: 0.0005
   log_every: 50
-  eval_every: 200
+  eval_every: 500
   lambda_rd: 0.01
 
 evaluation:

@@ -2,7 +2,8 @@ codec: "pcg"
 dataset: "librispeech_dummy"
 
 streaming:
-  sample_rate_hz: 24000
+  # LibriSpeech ASR dummy audio is typically 16kHz; using 16k avoids resampling.
+  sample_rate_hz: 16000
   hop_samples: 320
   lookahead_samples: 0
 
@@ -21,8 +22,8 @@ model:
 
   quantizer:
     type: "fsq"  # fsq | block_codebook
-    levels: 8         # FSQ levels per dimension
-    codebook_size: 256  # used by block_codebook
+    levels: 8
+    codebook_size: 256
 
   dag:
     depth: 1
@@ -47,17 +48,21 @@ loss:
 
 training:
   seed: 0
-  device: "cpu"
+  device: "cuda"
   batch_size: 8
-  steps: 1000
+  # Which dataset split to sample training batches from (train|val|test).
+  split: "train"
+  # Small defaults for a smoke test on the dummy dataset.
+  steps: 50
   lr: 0.001
-  log_every: 50
-  eval_every: 200
+  log_every: 10
+  eval_every: 25
   lambda_rd: 0.01
 
 evaluation:
+  # datasets.yaml maps "val" -> "validation" for librispeech_dummy.
   split: "val"
-  num_batches: 10
+  num_batches: 2
 
 output:
   results_dir: "pcg_codec/results"

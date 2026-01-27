@@ -22,3 +22,18 @@ def test_rans_roundtrip_random_symbols() -> None:
     decoded = rans_decode(data, cdfs, cfg=cfg)
     assert decoded == symbols
 
+
+def test_pmf_to_cdf_handles_many_tiny_probs() -> None:
+    cfg = RansConfig(precision_bits=16)
+    k = 4096
+    pmf = np.full((k,), 1e-12, dtype=np.float64)
+    pmf[0] = 1.0
+    pmf = pmf / pmf.sum()
+    cdf = pmf_to_cdf(pmf, cfg=cfg)
+    assert cdf.shape == (k + 1,)
+    assert int(cdf[0]) == 0
+    assert int(cdf[-1]) == cfg.total_freq
+    freqs = np.diff(cdf)
+    assert np.all(freqs >= 1)
+    assert int(freqs.sum()) == cfg.total_freq
+

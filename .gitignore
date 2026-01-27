@@ -14,3 +14,5 @@ build/
 pcg_codec/results/
 pcg_codec/data/
 
+# Local secrets / env
+.env

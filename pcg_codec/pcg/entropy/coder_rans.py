@@ -40,31 +40,36 @@ def pmf_to_cdf(pmf: np.ndarray, cfg: RansConfig = RansConfig()) -> np.ndarray:
     if pmf.size > total:
         raise ValueError("Alphabet too large for chosen precision_bits (need K <= total_freq)")
 
-    freq = np.floor(pmf * total).astype(np.int64)
-    freq[freq <= 0] = 1
+    # Allocate the minimum (1) to each symbol first, then distribute the remaining mass according
+    # to pmf. This avoids potentially huge adjustment loops when many pmf entries are < 1/total.
+    k = int(pmf.size)
+    remaining = total - k
+    if remaining < 0:
+        raise ValueError("Alphabet too large for chosen precision_bits (need K <= total_freq)")
 
-    diff = total - int(freq.sum())
-    if diff > 0:
-        # Add remaining counts to the largest fractional parts.
-        frac = (pmf * total) - np.floor(pmf * total)
-        order = np.argsort(-frac)
-        i = 0
-        while diff > 0:
-            freq[order[i % len(order)]] += 1
-            diff -= 1
-            i += 1
-    elif diff < 0:
-        # Remove extra counts from the largest frequencies.
-        order = np.argsort(-freq)
-        i = 0
-        while diff < 0:
-            idx = order[i % len(order)]
-            if freq[idx] > 1:
-                freq[idx] -= 1
-                diff += 1
-            i += 1
+    base = np.ones((k,), dtype=np.int64)
+    if remaining == 0:
+        freq = base
+    else:
+        ideal = pmf * float(remaining)
+        extra = np.floor(ideal).astype(np.int64)
+        freq = base + extra
 
-    if int(freq.sum()) != total:
+        diff = total - int(freq.sum())
+        if diff < 0:
+            raise RuntimeError("Failed to normalize frequencies to total_freq")
+        if diff > 0:
+            frac = ideal - np.floor(ideal)
+            if diff >= k:
+                # Should be rare, but handle safely.
+                idx = np.arange(k)
+            elif diff == 1:
+                idx = np.array([int(np.argmax(frac))])
+            else:
+                idx = np.argpartition(-frac, diff - 1)[:diff]
+            freq[idx] += 1
+
+    if int(freq.sum()) != total or np.any(freq <= 0):
         raise RuntimeError("Failed to normalize frequencies to total_freq")
 
     cdf = np.zeros((freq.size + 1,), dtype=np.int64)

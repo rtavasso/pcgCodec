@@ -67,7 +67,9 @@ class FSQQuantizer(nn.Module):
         step = 2.0 * self.data_range / (levels - 1.0)
         z_clamped = z.clamp(-self.data_range, self.data_range)
         idx = torch.round((z_clamped + self.data_range) / step).long()
-        idx = torch.clamp(idx, 0, levels.long() - 1)
+        # Avoid torch.clamp(min=int, max=tensor) which is not supported on some torch builds.
+        idx = idx.clamp_min(0)
+        idx = torch.minimum(idx, levels.to(dtype=idx.dtype) - 1)
         z_q = idx.float() * step - self.data_range
         z_hat = z + (z_q - z).detach()
         # Pack per-dimension indices into one symbol per block (mixed radix).

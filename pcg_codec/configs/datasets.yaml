@@ -21,3 +21,26 @@ datasets:
     split_hash: "music_example_v1"
     sample_rate_hz: 24000
     segment_seconds: 4.0
+
+  # Optional Hugging Face dataset example (requires network + `datasets[audio]`).
+  librispeech_dummy:
+    kind: "hf_dataset"
+    path: "hf-internal-testing/librispeech_asr_dummy"
+    name: "clean"
+    audio_column: "audio"
+    split_map:
+      # This internal dummy dataset only provides a "validation" split.
+      train: "validation"
+      val: "validation"
+      test: "validation"
+
+  # LibriSpeech (real) starter dataset. Downloads and caches via Hugging Face Datasets.
+  librispeech_train100:
+    kind: "hf_dataset"
+    path: "librispeech_asr"
+    name: "clean"
+    audio_column: "audio"
+    split_map:
+      train: "train.100"
+      val: "validation"
+      test: "test"
