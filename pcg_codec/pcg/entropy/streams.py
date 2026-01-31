@@ -179,6 +179,8 @@ class StreamingContainerReader:
             offset = tmp_off
 
         if offset > 0:
+            # `memoryview(self._buf)` is an active export; release it before resizing.
+            del view
             del self._buf[:offset]
         return out
 

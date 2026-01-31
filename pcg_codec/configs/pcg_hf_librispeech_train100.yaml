@@ -1,6 +1,6 @@
 codec: "pcg"
-#dataset: "librispeech_train100"
-dataset: "librispeech_dummy"
+dataset: "librispeech_train100"
+#dataset: "librispeech_dummy"
 
 streaming:
   # LibriSpeech is 16kHz; using 16k avoids resampling.
