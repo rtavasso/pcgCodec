@@ -552,6 +552,19 @@ To match compute across ablations:
 
 * Ablation comparisons include compute logs; plots are annotated “compute-matched” or explicitly not.
 
+### 6.4 Throughput benchmarking (training-time bottlenecks)
+
+This repo includes a lightweight benchmark runner to separate input/transfer/step time:
+
+* `python -m pcg_codec.pcg.training.benchmark --config pcg_codec/configs/pcg_hf_dummy.yaml --datasets pcg_codec/configs/datasets.yaml --iters 500 --warmup 50 --sync-cuda`
+* Use `--synthetic` to measure compute-only (bypasses dataset IO).
+
+Training configs can also set:
+
+* `training.dataloader.*` (e.g., `num_workers`, `pin_memory`, `persistent_workers`, `prefetch_factor`)
+* `training.amp.*` (e.g., `enabled`, `dtype`)
+* `training.timing.enabled: true` to emit `data_s`, `transfer_s`, `step_s` into `train_log.jsonl` (logging steps only).
+
 ---
 
 ## 7) Evaluation specification (must produce publishable artifacts)

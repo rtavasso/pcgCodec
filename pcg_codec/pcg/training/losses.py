@@ -31,6 +31,15 @@ class MultiResolutionSTFTLoss(nn.Module):
         self.win_lengths = list(win_lengths)
         if not (len(self.fft_sizes) == len(self.hop_sizes) == len(self.win_lengths)):
             raise ValueError("FFT sizes, hop sizes, and win lengths must match in length")
+        self._window_cache: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+
+    def _get_window(self, win_length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (str(device), dtype, int(win_length))
+        window = self._window_cache.get(key)
+        if window is None or window.device != device or window.dtype != dtype:
+            window = torch.hann_window(int(win_length), device=device, dtype=dtype)
+            self._window_cache[key] = window
+        return window
 
     def forward(self, x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
@@ -39,14 +48,12 @@ class MultiResolutionSTFTLoss(nn.Module):
             x_hat = x_hat.unsqueeze(0)
         loss = 0.0
         for fft, hop, win in zip(self.fft_sizes, self.hop_sizes, self.win_lengths):
-            window = torch.hann_window(win, device=x.device, dtype=x.dtype)
-            x_stft = torch.stft(x, n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
-            x_hat_stft = torch.stft(
-                x_hat, n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True
-            )
-            mag = torch.abs(x_stft)
-            mag_hat = torch.abs(x_hat_stft)
-            loss = loss + torch.mean(torch.abs(mag - mag_hat))
+            window = self._get_window(int(win), device=x.device, dtype=x.dtype)
+            xx = torch.cat([x, x_hat], dim=0)
+            xx_stft = torch.stft(xx, n_fft=fft, hop_length=hop, win_length=win, window=window, return_complex=True)
+            mag = torch.abs(xx_stft)
+            mag_x, mag_hat = mag.chunk(2, dim=0)
+            loss = loss + torch.mean(torch.abs(mag_x - mag_hat))
         return loss / len(self.fft_sizes)
 
 

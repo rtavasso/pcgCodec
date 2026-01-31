@@ -7,6 +7,7 @@ to the run directory, as required by the experimentation spec.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -20,6 +21,7 @@ import soundfile as sf
 import torch
 import torch.nn.functional as F
 from scipy.signal import resample_poly  # type: ignore
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from ..entropy.dag import Dag, build_dag_layers
 from ..entropy.prior_model import LayeredCausalPrior
@@ -66,19 +68,38 @@ def teacher_forced_rate_loss(prior: LayeredCausalPrior, dag: Dag, q_frames: torc
     if num_blocks != prior.num_blocks:
         raise ValueError("q_frames num_blocks mismatch prior")
     state = prior.init_state(batch_size=batch, device=q_frames.device)
+
+    max_parents = 0
+    for b in range(num_blocks):
+        max_parents = max(max_parents, len(dag.parents.get(int(b), [])))
+    parent_idx = None
+    parent_mask = None
+    if max_parents > 0:
+        parent_idx = torch.full((num_blocks, max_parents), -1, dtype=torch.long, device=q_frames.device)
+        parent_mask = torch.zeros((num_blocks, max_parents), dtype=torch.bool, device=q_frames.device)
+        for b in range(num_blocks):
+            pa = dag.parents.get(int(b), [])
+            if not pa:
+                continue
+            parent_idx[b, : len(pa)] = torch.tensor(pa, dtype=torch.long, device=q_frames.device)
+            parent_mask[b, : len(pa)] = True
+
     total = torch.zeros((), device=q_frames.device)
-    count = 0
+    count = batch * time * num_blocks
+    block_context = prior.block_embed(torch.arange(num_blocks, device=q_frames.device, dtype=torch.long)).unsqueeze(0)
     for t in range(time):
-        q_t = q_frames[:, t, :].long()
-        for layer in dag.layers:
-            for b in layer:
-                pa = dag.parents.get(int(b), [])
-                parent_tokens = q_t[:, pa] if pa else None
-                logits = prior.predict_block(state, int(b), parent_tokens=parent_tokens)
-                total = total + F.cross_entropy(logits, q_t[:, int(b)], reduction="sum")
-                count += batch
+        q_t = q_frames[:, t, :]
+        if parent_idx is not None and parent_mask is not None:
+            idx = parent_idx.clamp_min(0)
+            pt = q_t[:, idx]  # (batch, num_blocks, max_parents)
+            logits = prior.predict_all_blocks(
+                state, parent_tokens_by_block=pt, parent_mask=parent_mask, block_context=block_context
+            )
+        else:
+            logits = prior.predict_all_blocks(state, block_context=block_context)
+        total = total + F.cross_entropy(logits.reshape(-1, prior.codebook_size), q_t.reshape(-1), reduction="sum")
         state = prior.update_state(state, q_t)
-    return total / max(count, 1)
+    return total / max(int(count), 1)
 
 
 def train_step(
@@ -91,6 +112,12 @@ def train_step(
     beta_sens: float = 0.0,
     gamma_orth: float = 0.0,
     gamma_cov: float = 0.0,
+    *,
+    non_blocking: bool = False,
+    autocast_enabled: bool = False,
+    autocast_dtype: torch.dtype = torch.bfloat16,
+    grad_scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    sync_metrics: bool = True,
 ) -> dict:
     components.encoder.train()
     components.decoder.train()
@@ -101,50 +128,70 @@ def train_step(
     if components.prior is not None and components.dag is None:
         raise ValueError("components.dag must be set when components.prior is used")
 
-    x = _extract_audio(batch).to(device)
+    x = _extract_audio(batch)
+    if x.device != device:
+        x = x.to(device, non_blocking=non_blocking)
+
     optimizer.zero_grad(set_to_none=True)
-    z = components.encoder(x)
-    z = components.transform(z)
-    batch_size, frames, latent_dim = z.shape
-    z_flat = z.reshape(batch_size * frames, latent_dim)
-    q_out = components.quantizer(z_flat)
-    z_hat = q_out.z_hat.reshape(batch_size, frames, latent_dim)
-    x_hat = components.decoder(z_hat)
-    recon = waveform_l1(x, x_hat)
-    if stft_loss is not None:
-        recon = recon + stft_loss(x, x_hat)
+    autocast_ctx = (
+        torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_enabled)
+        if device.type in {"cuda", "cpu"}
+        else contextlib.nullcontext()
+    )
+    with autocast_ctx:
+        z = components.encoder(x)
+        z = components.transform(z)
+        batch_size, frames, latent_dim = z.shape
+        z_flat = z.reshape(batch_size * frames, latent_dim)
+        q_out = components.quantizer(z_flat)
+        z_hat = q_out.z_hat.reshape(batch_size, frames, latent_dim)
+        x_hat = components.decoder(z_hat)
+        recon = waveform_l1(x, x_hat)
+        if stft_loss is not None:
+            recon = recon + stft_loss(x, x_hat)
 
-    rate_loss = torch.tensor(0.0, device=x.device)
-    if components.prior is not None and lambda_rate > 0.0:
-        symbols = q_out.symbols.reshape(batch_size, frames, -1)
-        rate_loss = teacher_forced_rate_loss(components.prior, components.dag, symbols)
+        rate_loss = torch.tensor(0.0, device=x.device, dtype=recon.dtype)
+        if components.prior is not None and lambda_rate > 0.0:
+            symbols = q_out.symbols.reshape(batch_size, frames, -1)
+            rate_loss = teacher_forced_rate_loss(components.prior, components.dag, symbols)
 
-    sens_loss = torch.tensor(0.0, device=x.device)
-    if beta_sens > 0.0:
-        num_blocks = _infer_num_blocks(components.quantizer, q_out.symbols.reshape(batch_size, frames, -1))
-        sens_loss = sensitivity_equalization(z_flat, recon, num_blocks)
+        sens_loss = torch.tensor(0.0, device=x.device, dtype=recon.dtype)
+        if beta_sens > 0.0:
+            num_blocks = _infer_num_blocks(components.quantizer, q_out.symbols.reshape(batch_size, frames, -1))
+            sens_loss = sensitivity_equalization(z_flat, recon, num_blocks)
 
-    orth_loss = torch.tensor(0.0, device=x.device)
-    if gamma_orth > 0.0 and hasattr(components.transform, "regularizer"):
-        orth_loss = components.transform.regularizer().to(device=x.device)
+        orth_loss = torch.tensor(0.0, device=x.device, dtype=recon.dtype)
+        if gamma_orth > 0.0 and hasattr(components.transform, "regularizer"):
+            orth_loss = components.transform.regularizer().to(device=x.device, dtype=recon.dtype)
 
-    cov_loss = torch.tensor(0.0, device=x.device)
-    if gamma_cov > 0.0 and hasattr(components.transform, "offdiag_covariance"):
-        num_blocks = _infer_num_blocks(components.quantizer, q_out.symbols.reshape(batch_size, frames, -1))
-        cov_loss = components.transform.offdiag_covariance(z_flat, num_blocks=num_blocks).to(device=x.device)
+        cov_loss = torch.tensor(0.0, device=x.device, dtype=recon.dtype)
+        if gamma_cov > 0.0 and hasattr(components.transform, "offdiag_covariance"):
+            num_blocks = _infer_num_blocks(components.quantizer, q_out.symbols.reshape(batch_size, frames, -1))
+            cov_loss = components.transform.offdiag_covariance(z_flat, num_blocks=num_blocks).to(
+                device=x.device, dtype=recon.dtype
+            )
 
-    total = recon + lambda_rate * rate_loss + beta_sens * sens_loss + gamma_orth * orth_loss + gamma_cov * cov_loss
-    total.backward()
-    optimizer.step()
+        total = recon + lambda_rate * rate_loss + beta_sens * sens_loss + gamma_orth * orth_loss + gamma_cov * cov_loss
 
-    return {
-        "loss": float(total.detach().cpu()),
-        "recon": float(recon.detach().cpu()),
-        "rate": float(rate_loss.detach().cpu()),
-        "sens": float(sens_loss.detach().cpu()),
-        "orth": float(orth_loss.detach().cpu()),
-        "cov": float(cov_loss.detach().cpu()),
+    if grad_scaler is not None and autocast_enabled and device.type == "cuda" and autocast_dtype == torch.float16:
+        grad_scaler.scale(total).backward()
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
+    else:
+        total.backward()
+        optimizer.step()
+
+    metrics = {
+        "loss": total.detach(),
+        "recon": recon.detach(),
+        "rate": rate_loss.detach(),
+        "sens": sens_loss.detach(),
+        "orth": orth_loss.detach(),
+        "cov": cov_loss.detach(),
     }
+    if not sync_metrics:
+        return metrics
+    return {k: float(v.detach().float().cpu()) for k, v in metrics.items()}
 
 
 def train_one_epoch(
@@ -158,7 +205,7 @@ def train_one_epoch(
     gamma_orth: float = 0.0,
     gamma_cov: float = 0.0,
 ) -> dict:
-    metrics = {"loss": 0.0, "recon": 0.0, "rate": 0.0, "sens": 0.0, "orth": 0.0, "cov": 0.0}
+    metrics: dict[str, float] = {"loss": 0.0, "recon": 0.0, "rate": 0.0, "sens": 0.0, "orth": 0.0, "cov": 0.0}
     steps = 0
     for batch in dataloader:
         out = train_step(
@@ -173,7 +220,11 @@ def train_one_epoch(
             gamma_cov=gamma_cov,
         )
         for key in metrics:
-            metrics[key] += out[key]
+            val = out[key]
+            if torch.is_tensor(val):
+                metrics[key] += float(val.detach().float().cpu())
+            else:
+                metrics[key] += float(val)
         steps += 1
     if steps > 0:
         for key in metrics:
@@ -229,6 +280,64 @@ def _load_audio_mono(path: str, target_sr: int) -> np.ndarray:
         down = int(sr) // g
         audio = resample_poly(audio, up=up, down=down).astype(np.float32, copy=False)
     return audio.astype(np.float32, copy=False)
+
+
+def _load_random_segment_mono(
+    path: str,
+    target_sr: int,
+    segment_samples: int,
+    hop_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Load a random mono segment, attempting to avoid decoding the full file."""
+    try:
+        with sf.SoundFile(path) as f:
+            sr = int(f.samplerate)
+            frames = int(len(f))
+            if sr == target_sr:
+                need = int(segment_samples)
+                if frames <= need:
+                    f.seek(0)
+                    audio = f.read(frames, dtype="float32", always_2d=True)
+                    audio = np.mean(audio, axis=1)
+                    if len(audio) < need:
+                        audio = np.pad(audio, (0, need - len(audio)))
+                    seg = audio[:need]
+                else:
+                    start = int(rng.integers(0, frames - need + 1))
+                    f.seek(start)
+                    audio = f.read(need, dtype="float32", always_2d=True)
+                    seg = np.mean(audio, axis=1)
+            else:
+                g = int(np.gcd(int(sr), int(target_sr)))
+                up = int(target_sr) // g
+                down = int(sr) // g
+                need_src = int(np.ceil(segment_samples * down / up)) + int(4 * down)
+                need_src = max(1, need_src)
+                if frames <= need_src:
+                    f.seek(0)
+                    audio = f.read(frames, dtype="float32", always_2d=True)
+                    audio = np.mean(audio, axis=1)
+                else:
+                    start = int(rng.integers(0, frames - need_src + 1))
+                    f.seek(start)
+                    audio = f.read(need_src, dtype="float32", always_2d=True)
+                    audio = np.mean(audio, axis=1)
+                audio = resample_poly(audio, up=up, down=down).astype(np.float32, copy=False)
+                if len(audio) < segment_samples:
+                    audio = np.pad(audio, (0, segment_samples - len(audio)))
+                seg = audio[:segment_samples]
+    except Exception:
+        audio = _load_audio_mono(path, target_sr)
+        if len(audio) < segment_samples:
+            audio = np.pad(audio, (0, segment_samples - len(audio)))
+        start = int(rng.integers(0, max(1, len(audio) - segment_samples + 1)))
+        seg = audio[start : start + segment_samples]
+
+    rem = len(seg) % hop_samples
+    if rem != 0:
+        seg = np.pad(seg, (0, hop_samples - rem))
+    return seg.astype(np.float32, copy=False)
 
 
 def _load_hf_dataset(d: dict, split: str):
@@ -339,14 +448,13 @@ def _iter_batches(
         batch = []
         for _ in range(batch_size):
             path = str(files[int(rng.integers(0, len(files)))])
-            audio = _load_audio_mono(path, sample_rate_hz)
-            if len(audio) < segment_samples:
-                audio = np.pad(audio, (0, segment_samples - len(audio)))
-            start = int(rng.integers(0, max(1, len(audio) - segment_samples + 1)))
-            seg = audio[start : start + segment_samples]
-            rem = len(seg) % hop_samples
-            if rem != 0:
-                seg = np.pad(seg, (0, hop_samples - rem))
+            seg = _load_random_segment_mono(
+                path,
+                target_sr=sample_rate_hz,
+                segment_samples=segment_samples,
+                hop_samples=hop_samples,
+                rng=rng,
+            )
             batch.append(torch.from_numpy(seg))
         yield torch.stack(batch, dim=0)
 
@@ -399,6 +507,168 @@ def _iter_batches_hf(
                 seg = np.pad(seg, (0, hop_samples - rem))
             batch.append(torch.from_numpy(seg))
         yield torch.stack(batch, dim=0)
+
+
+class _InfiniteLocalWavSegments(IterableDataset):
+    def __init__(
+        self,
+        files: list[str],
+        *,
+        sample_rate_hz: int,
+        segment_samples: int,
+        hop_samples: int,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        self.files = list(files)
+        self.sample_rate_hz = int(sample_rate_hz)
+        self.segment_samples = int(segment_samples)
+        self.hop_samples = int(hop_samples)
+        self.seed = int(seed)
+
+    def __iter__(self):
+        info = get_worker_info()
+        worker_id = 0 if info is None else int(info.id)
+        rng = np.random.default_rng(self.seed + 1009 * worker_id)
+        if not self.files:
+            raise RuntimeError("No audio files found for the requested split")
+        while True:
+            path = str(self.files[int(rng.integers(0, len(self.files)))])
+            seg = _load_random_segment_mono(
+                path,
+                target_sr=self.sample_rate_hz,
+                segment_samples=self.segment_samples,
+                hop_samples=self.hop_samples,
+                rng=rng,
+            )
+            yield torch.from_numpy(seg)
+
+
+class _InfiniteHFDatasetSegments(IterableDataset):
+    def __init__(
+        self,
+        ds,
+        *,
+        sample_rate_hz: int,
+        segment_samples: int,
+        hop_samples: int,
+        seed: int,
+        audio_column: str = "audio",
+        max_retries: int = 50,
+    ) -> None:
+        super().__init__()
+        self.ds = ds
+        self.sample_rate_hz = int(sample_rate_hz)
+        self.segment_samples = int(segment_samples)
+        self.hop_samples = int(hop_samples)
+        self.seed = int(seed)
+        self.audio_column = str(audio_column)
+        self.max_retries = int(max_retries)
+
+    def __iter__(self):
+        info = get_worker_info()
+        worker_id = 0 if info is None else int(info.id)
+        rng = np.random.default_rng(self.seed + 1009 * worker_id)
+
+        ds = self.ds
+        try:
+            from datasets import Audio  # type: ignore
+
+            ds = ds.cast_column(self.audio_column, Audio(decode=False))
+        except Exception:
+            pass
+
+        if len(ds) <= 0:
+            raise RuntimeError("No examples found in Hugging Face dataset for the requested split")
+
+        while True:
+            last_exc: Exception | None = None
+            for _try in range(self.max_retries):
+                i = int(rng.integers(0, len(ds)))
+                try:
+                    ex = _hf_get_raw_example(ds, i)
+                    audio = _load_audio_hf_example(ex, audio_column=self.audio_column, target_sr=self.sample_rate_hz)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_exc = e
+                    continue
+            else:
+                raise RuntimeError(
+                    f"Failed to load audio from hf dataset after {self.max_retries} attempts; "
+                    "check `audio_column` and your audio backend dependencies."
+                ) from last_exc
+            if len(audio) < self.segment_samples:
+                audio = np.pad(audio, (0, self.segment_samples - len(audio)))
+            start = int(rng.integers(0, max(1, len(audio) - self.segment_samples + 1)))
+            seg = audio[start : start + self.segment_samples]
+            rem = len(seg) % self.hop_samples
+            if rem != 0:
+                seg = np.pad(seg, (0, self.hop_samples - rem))
+            yield torch.from_numpy(seg.astype(np.float32, copy=False))
+
+
+def build_train_dataloader(
+    cfg: dict,
+    ds_cfg: dict,
+    *,
+    device: torch.device,
+) -> tuple[DataLoader, bool]:
+    seed = int(cfg["training"]["seed"])
+    dataset_name = str(cfg["dataset"])
+    d = ds_cfg["datasets"][dataset_name]
+    hop = int(cfg["streaming"]["hop_samples"])
+    sr = int(cfg["streaming"]["sample_rate_hz"])
+    seg_s = float(d.get("segment_seconds", ds_cfg.get("defaults", {}).get("segment_seconds", 4.0)))
+    seg_samples = int(round(seg_s * sr))
+    train_split = str(cfg.get("training", {}).get("split", "train"))
+    batch_size = int(cfg["training"]["batch_size"])
+
+    dl_cfg = cfg.get("training", {}).get("dataloader", {}) or {}
+    num_workers = int(dl_cfg.get("num_workers", 0))
+    pin_memory = bool(dl_cfg.get("pin_memory", device.type == "cuda"))
+    persistent_workers = bool(dl_cfg.get("persistent_workers", True)) and num_workers > 0
+    prefetch_factor = int(dl_cfg.get("prefetch_factor", 2))
+
+    kind = str(d.get("kind", "local_wav_dir"))
+    if kind == "local_wav_dir":
+        root = str(d["root"])
+        files = _list_wavs(root)
+        split_hash = str(d["split_hash"])
+        split_defaults = ds_cfg.get("defaults", {}).get("split", {})
+        train_pct = int(split_defaults.get("train_pct", 80))
+        val_pct = int(split_defaults.get("val_pct", 10))
+        train_files = _split_files(files, split_hash, train_split, train_pct=train_pct, val_pct=val_pct)
+        dataset = _InfiniteLocalWavSegments(
+            train_files,
+            sample_rate_hz=sr,
+            segment_samples=seg_samples,
+            hop_samples=hop,
+            seed=seed,
+        )
+    elif kind == "hf_dataset":
+        audio_column = str(d.get("audio_column", "audio"))
+        ds = _load_hf_dataset(d, split=train_split)
+        dataset = _InfiniteHFDatasetSegments(
+            ds,
+            sample_rate_hz=sr,
+            segment_samples=seg_samples,
+            hop_samples=hop,
+            seed=seed,
+            audio_column=audio_column,
+        )
+    else:
+        raise SystemExit(f"Unsupported datasets.kind={kind!r}; expected local_wav_dir|hf_dataset")
+
+    kwargs: dict = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "drop_last": True,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = prefetch_factor
+    return DataLoader(dataset, **kwargs), pin_memory
 
 
 def build_components(cfg: dict) -> PCGComponents:
@@ -483,6 +753,20 @@ def main() -> None:
     np.random.seed(seed)
 
     device = torch.device(str(cfg["training"]["device"]))
+    if device.type == "cuda":
+        cuda_cfg = cfg.get("training", {}).get("cuda", {}) or {}
+        if bool(cuda_cfg.get("cudnn_benchmark", True)):
+            torch.backends.cudnn.benchmark = True
+        if bool(cuda_cfg.get("allow_tf32", True)):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        matmul_prec = str(cuda_cfg.get("matmul_precision", "high"))
+        if matmul_prec:
+            try:
+                torch.set_float32_matmul_precision(matmul_prec)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
     components = build_components(cfg)
     components.encoder.to(device)
     components.decoder.to(device)
@@ -491,45 +775,21 @@ def main() -> None:
     if components.prior is not None:
         components.prior.to(device)
 
-    dataset_name = str(cfg["dataset"])
-    d = ds_cfg["datasets"][dataset_name]
-    hop = int(cfg["streaming"]["hop_samples"])
-    sr = int(cfg["streaming"]["sample_rate_hz"])
-    seg_s = float(d.get("segment_seconds", ds_cfg.get("defaults", {}).get("segment_seconds", 4.0)))
-    seg_samples = int(round(seg_s * sr))
-    train_split = str(cfg.get("training", {}).get("split", "train"))
+    compile_cfg = cfg.get("training", {}).get("compile", {}) or {}
+    if bool(compile_cfg.get("enabled", False)):
+        mode = compile_cfg.get("mode", None)
+        kwargs = {}
+        if mode is not None:
+            kwargs["mode"] = str(mode)
+        components.encoder = torch.compile(components.encoder, **kwargs)  # type: ignore[assignment]
+        components.decoder = torch.compile(components.decoder, **kwargs)  # type: ignore[assignment]
+        components.transform = torch.compile(components.transform, **kwargs)  # type: ignore[assignment]
+        components.quantizer = torch.compile(components.quantizer, **kwargs)  # type: ignore[assignment]
+        if components.prior is not None:
+            components.prior = torch.compile(components.prior, **kwargs)  # type: ignore[assignment]
 
-    kind = str(d.get("kind", "local_wav_dir"))
-    if kind == "local_wav_dir":
-        root = str(d["root"])
-        files = _list_wavs(root)
-        split_hash = str(d["split_hash"])
-        split_defaults = ds_cfg.get("defaults", {}).get("split", {})
-        train_pct = int(split_defaults.get("train_pct", 80))
-        val_pct = int(split_defaults.get("val_pct", 10))
-        train_files = _split_files(files, split_hash, train_split, train_pct=train_pct, val_pct=val_pct)
-        train_iter = _iter_batches(
-            train_files,
-            batch_size=int(cfg["training"]["batch_size"]),
-            segment_samples=seg_samples,
-            hop_samples=hop,
-            sample_rate_hz=sr,
-            seed=seed,
-        )
-    elif kind == "hf_dataset":
-        audio_column = str(d.get("audio_column", "audio"))
-        ds = _load_hf_dataset(d, split=train_split)
-        train_iter = _iter_batches_hf(
-            ds,
-            batch_size=int(cfg["training"]["batch_size"]),
-            segment_samples=seg_samples,
-            hop_samples=hop,
-            sample_rate_hz=sr,
-            seed=seed,
-            audio_column=audio_column,
-        )
-    else:
-        raise SystemExit(f"Unsupported datasets.kind={kind!r}; expected local_wav_dir|hf_dataset")
+    train_loader, pin_memory = build_train_dataloader(cfg, ds_cfg, device=device)
+    train_iter = iter(train_loader)
 
     stft_cfg = cfg["loss"]["mrstft"]
     stft_loss = None
@@ -561,6 +821,31 @@ def main() -> None:
     log_every = int(cfg["training"]["log_every"])
     eval_every = int(cfg["training"]["eval_every"])
 
+    amp_cfg = cfg.get("training", {}).get("amp", {}) or {}
+    autocast_enabled = bool(amp_cfg.get("enabled", device.type == "cuda"))
+    dtype_name = str(amp_cfg.get("dtype", "bfloat16")).lower()
+    if dtype_name in {"bf16", "bfloat16"}:
+        autocast_dtype = torch.bfloat16
+    elif dtype_name in {"fp16", "float16"}:
+        autocast_dtype = torch.float16
+    elif dtype_name in {"fp32", "float32"}:
+        autocast_enabled = False
+        autocast_dtype = torch.float32
+    else:
+        raise ValueError("training.amp.dtype must be one of bf16|fp16|fp32")
+    grad_scaler: Optional[torch.cuda.amp.GradScaler] = None
+    if (
+        device.type == "cuda"
+        and autocast_enabled
+        and autocast_dtype == torch.float16
+        and bool(amp_cfg.get("grad_scaler", True))
+    ):
+        grad_scaler = torch.cuda.amp.GradScaler()
+
+    timing_cfg = cfg.get("training", {}).get("timing", {}) or {}
+    timing_enabled = bool(timing_cfg.get("enabled", False))
+    timing_sync_cuda = bool(timing_cfg.get("sync_cuda", True))
+
     log_path = os.path.join(args.run_dir, "train_log.jsonl")
     t_start = time.perf_counter()
 
@@ -580,47 +865,86 @@ def main() -> None:
         )
         print(msg, flush=True)
 
-    for step in range(1, steps + 1):
-        batch = next(train_iter).to(device)
-        out = train_step(
-            components,
-            batch,
-            optimizer,
-            device,
-            stft_loss=stft_loss,
-            lambda_rate=lambda_rd,
-            beta_sens=beta_sens,
-            gamma_orth=gamma_orth,
-            gamma_cov=gamma_cov,
-        )
+    with open(log_path, "a", encoding="utf-8") as log_f:
+        for step in range(1, steps + 1):
+            if timing_enabled:
+                t_data0 = time.perf_counter()
+            batch = next(train_iter)
+            if timing_enabled:
+                t_data1 = time.perf_counter()
+            non_blocking = bool(pin_memory and device.type == "cuda")
+            if torch.is_tensor(batch) and batch.device != device:
+                if timing_enabled and timing_sync_cuda and device.type == "cuda":
+                    torch.cuda.synchronize()
+                if timing_enabled:
+                    t_xfer0 = time.perf_counter()
+                batch = batch.to(device, non_blocking=non_blocking)
+                if timing_enabled and timing_sync_cuda and device.type == "cuda":
+                    torch.cuda.synchronize()
+                if timing_enabled:
+                    t_xfer1 = time.perf_counter()
+            else:
+                if timing_enabled:
+                    t_xfer0 = t_data1
+                    t_xfer1 = t_data1
 
-        if step % log_every == 0:
-            out["step"] = step
-            out["wall_s"] = time.perf_counter() - t_start
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(out) + "\n")
-            _maybe_print(step, out)
-
-        if step % eval_every == 0:
-            if not args.quiet:
-                print(f"[eval] step={step}/{steps} writing checkpoint + eval.json...", flush=True)
-            ckpt_path = os.path.join(args.run_dir, "checkpoint.pt")
-            torch.save(
-                {
-                    "cfg": cfg,
-                    "encoder": components.encoder.state_dict(),
-                    "decoder": components.decoder.state_dict(),
-                    "transform": components.transform.state_dict(),
-                    "quantizer": components.quantizer.state_dict(),
-                    "prior": components.prior.state_dict() if components.prior is not None else None,
-                },
-                ckpt_path,
+            log_this_step = step % log_every == 0
+            if timing_enabled and timing_sync_cuda and device.type == "cuda":
+                torch.cuda.synchronize()
+            if timing_enabled:
+                t_step0 = time.perf_counter()
+            out = train_step(
+                components,
+                batch,
+                optimizer,
+                device,
+                stft_loss=stft_loss,
+                lambda_rate=lambda_rd,
+                beta_sens=beta_sens,
+                gamma_orth=gamma_orth,
+                gamma_cov=gamma_cov,
+                non_blocking=non_blocking,
+                autocast_enabled=autocast_enabled,
+                autocast_dtype=autocast_dtype,
+                grad_scaler=grad_scaler,
+                sync_metrics=log_this_step,
             )
-            if not args.quiet:
-                print(f"[eval] checkpoint saved: {ckpt_path}", flush=True)
-            evaluate_streaming_to_json(cfg, ds_cfg, run_dir=args.run_dir, checkpoint_path=ckpt_path)
-            if not args.quiet:
-                print(f"[eval] wrote {os.path.join(args.run_dir, 'eval.json')}", flush=True)
+            if timing_enabled and timing_sync_cuda and device.type == "cuda":
+                torch.cuda.synchronize()
+            if timing_enabled:
+                t_step1 = time.perf_counter()
+
+            if step % log_every == 0:
+                if timing_enabled:
+                    out["data_s"] = t_data1 - t_data0
+                    out["transfer_s"] = t_xfer1 - t_xfer0
+                    out["step_s"] = t_step1 - t_step0
+                out["step"] = step
+                out["wall_s"] = time.perf_counter() - t_start
+                log_f.write(json.dumps(out) + "\n")
+                log_f.flush()
+                _maybe_print(step, out)
+
+            if step % eval_every == 0:
+                if not args.quiet:
+                    print(f"[eval] step={step}/{steps} writing checkpoint + eval.json...", flush=True)
+                ckpt_path = os.path.join(args.run_dir, "checkpoint.pt")
+                torch.save(
+                    {
+                        "cfg": cfg,
+                        "encoder": components.encoder.state_dict(),
+                        "decoder": components.decoder.state_dict(),
+                        "transform": components.transform.state_dict(),
+                        "quantizer": components.quantizer.state_dict(),
+                        "prior": components.prior.state_dict() if components.prior is not None else None,
+                    },
+                    ckpt_path,
+                )
+                if not args.quiet:
+                    print(f"[eval] checkpoint saved: {ckpt_path}", flush=True)
+                evaluate_streaming_to_json(cfg, ds_cfg, run_dir=args.run_dir, checkpoint_path=ckpt_path)
+                if not args.quiet:
+                    print(f"[eval] wrote {os.path.join(args.run_dir, 'eval.json')}", flush=True)
 
     ckpt_path = os.path.join(args.run_dir, "checkpoint.pt")
     torch.save(

@@ -57,6 +57,22 @@ training:
   seed: 0
   device: "cuda"
   batch_size: 8
+  dataloader:
+    num_workers: 2
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+  amp:
+    enabled: true
+    dtype: "bfloat16"  # bfloat16 | float16 | float32
+    grad_scaler: true  # only used for float16 on CUDA
+  cuda:
+    cudnn_benchmark: true
+    allow_tf32: true
+    matmul_precision: "high"
+  timing:
+    enabled: false
+    sync_cuda: true
   # Which dataset split to sample training batches from (train|val|test).
   split: "train"
   # Small defaults for a smoke test on the dummy dataset.

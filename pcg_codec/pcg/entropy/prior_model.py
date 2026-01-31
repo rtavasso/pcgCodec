@@ -85,6 +85,52 @@ class LayeredCausalPrior(nn.Module):
         context = torch.tanh(state + parent_context + self.block_embed(torch.tensor(block_id, device=state.device)))
         return self.out(context)
 
+    def predict_all_blocks(
+        self,
+        state: torch.Tensor,
+        parent_tokens_by_block: Optional[torch.Tensor] = None,
+        parent_mask: Optional[torch.Tensor] = None,
+        block_context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict logits for all blocks in parallel.
+
+        Args:
+            state: (batch, hidden_dim)
+            parent_tokens_by_block: Optional (batch, num_blocks, parents_k) teacher-forced parent tokens.
+            parent_mask: Optional (num_blocks, parents_k) boolean mask for valid parent positions.
+        Returns:
+            logits: (batch, num_blocks, codebook_size)
+        """
+        if state.dim() != 2:
+            raise ValueError("state must have shape (batch, hidden_dim)")
+        if block_context is None:
+            block_ids = torch.arange(self.num_blocks, device=state.device, dtype=torch.long)
+            block_context = self.block_embed(block_ids).unsqueeze(0)  # (1, num_blocks, hidden_dim)
+        else:
+            if block_context.dim() != 3 or block_context.size(1) != self.num_blocks or block_context.size(2) != self.hidden_dim:
+                raise ValueError("block_context must have shape (1, num_blocks, hidden_dim) or (batch, num_blocks, hidden_dim)")
+        parent_context = torch.zeros(
+            state.size(0), self.num_blocks, self.hidden_dim, device=state.device, dtype=state.dtype
+        )
+
+        if parent_tokens_by_block is not None and parent_tokens_by_block.numel() > 0:
+            if parent_tokens_by_block.dim() != 3 or parent_tokens_by_block.size(1) != self.num_blocks:
+                raise ValueError("parent_tokens_by_block must have shape (batch, num_blocks, parents_k)")
+            embed = self.token_embed(parent_tokens_by_block.long().clamp(0, self.codebook_size - 1))
+            if parent_mask is not None:
+                if parent_mask.dim() != 2 or parent_mask.size(0) != self.num_blocks:
+                    raise ValueError("parent_mask must have shape (num_blocks, parents_k)")
+                mask = parent_mask.to(device=embed.device).unsqueeze(0).unsqueeze(-1)  # (1, num_blocks, parents_k, 1)
+                embed = embed * mask
+                denom = mask.sum(dim=2).clamp_min(1.0)
+                parent_embed = embed.sum(dim=2) / denom
+            else:
+                parent_embed = embed.mean(dim=2)
+            parent_context = self.parent_proj(parent_embed)
+
+        context = torch.tanh(state.unsqueeze(1) + parent_context + block_context)
+        return self.out(context)
+
     def forward(
         self,
         q_frames: torch.Tensor,

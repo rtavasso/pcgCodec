@@ -49,7 +49,7 @@ def evaluate(
     if components.prior is not None:
         components.prior.eval()
 
-    metrics = {"loss": 0.0, "recon": 0.0}
+    metrics_t = {"loss": torch.zeros((), device=device), "recon": torch.zeros((), device=device)}
     steps = 0
     with torch.no_grad():
         for batch in dataloader:
@@ -64,13 +64,12 @@ def evaluate(
             recon = waveform_l1(x, x_hat)
             if stft_loss is not None:
                 recon = recon + stft_loss(x, x_hat)
-            metrics["loss"] += float(recon.detach().cpu())
-            metrics["recon"] += float(recon.detach().cpu())
+            metrics_t["loss"] += recon.detach()
+            metrics_t["recon"] += recon.detach()
             steps += 1
-    if steps > 0:
-        for key in metrics:
-            metrics[key] /= steps
-    return metrics
+    if steps <= 0:
+        return {"loss": 0.0, "recon": 0.0}
+    return {k: float((v / steps).detach().float().cpu()) for k, v in metrics_t.items()}
 
 
 def _load_yaml(path: str) -> dict:
