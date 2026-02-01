@@ -377,7 +377,9 @@ def evaluate_streaming(
 
     seg_s = float(d.get("segment_seconds", ds_cfg.get("defaults", {}).get("segment_seconds", 4.0)))
     seg_samples = int(round(seg_s * sr))
-    batch_size = int(cfg["training"]["batch_size"])
+    batch_size = int(cfg.get("evaluation", {}).get("batch_size", cfg["training"]["batch_size"]))
+    if batch_size <= 0:
+        raise ValueError("evaluation.batch_size must be positive")
     num_batches = int(cfg.get("evaluation", {}).get("num_batches", 10))
     seed = int(cfg["training"]["seed"])
     if progress:

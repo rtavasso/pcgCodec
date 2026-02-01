@@ -83,7 +83,11 @@ training:
 
 evaluation:
   split: "val"
+  # Streaming evaluation is expensive (it runs frame-by-frame encode/decode loops).
+  # Use a smaller eval batch size than training to keep periodic eval fast.
+  batch_size: 8
   num_batches: 10
+  progress: true
   ttfa_chunk_bytes: 256
 
 output:
